@@ -15,6 +15,7 @@ import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import joblib
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.cluster import KMeans, DBSCAN
@@ -126,6 +127,17 @@ def label_zone(congestion: float) -> str:
         return "Free Flow Zone"
 
 
+@st.cache_resource
+def load_saved_models():
+    """Load serialized models if available; fall back to in-memory models otherwise."""
+    try:
+        kmeans_saved = joblib.load("models/kmeans_model.pkl")
+        scaler_saved = joblib.load("models/scaler.pkl")
+        return kmeans_saved, scaler_saved, None
+    except Exception as exc:
+        return None, None, str(exc)
+
+
 # ─────────────────────────── Sidebar ────────────────────────────────
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/traffic-jam.png", width=80)
@@ -140,6 +152,7 @@ with st.sidebar:
             "🔎 DBSCAN Clustering",
             "⚖️ Model Comparison",
             "📋 Metrics Summary",
+            "🔮 Prediction",
         ],
         index=0,
     )
@@ -198,6 +211,11 @@ df_model["DBSCAN_Label"] = db_labels
 df_model["Is_Anomaly"] = (db_labels == -1).astype(int)
 n_clusters_db = len(set(db_labels)) - (1 if -1 in db_labels else 0)
 n_noise_db = (db_labels == -1).sum()
+
+# Prefer persisted artifacts for prediction if present.
+kmeans_saved, scaler_saved, model_load_error = load_saved_models()
+predict_kmeans = kmeans_saved if kmeans_saved is not None else kmeans
+predict_scaler = scaler_saved if scaler_saved is not None else scaler
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -276,6 +294,82 @@ if page == "🏠 Home":
 
 
 # ──────────────────────── 📊 EDA ───────────────────────────────────
+elif page == "🔮 Prediction":
+    st.markdown("## 🔮 Prediction")
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.markdown(
+        "Adjust a few traffic parameters and run prediction. "
+        "The app auto-generates the full feature vector and returns cluster-based output."
+    )
+
+    if model_load_error:
+        st.warning(
+            "Saved .pkl models were not loaded; prediction is using current in-session model. "
+            f"Details: {model_load_error}"
+        )
+    else:
+        st.success("Using saved models from the models folder.")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        traffic_intensity = st.slider("Traffic Intensity", 0, 100, 60)
+        network_stress = st.slider("Network Stress", 0, 100, 50)
+        compliance_level = st.slider("Signal Compliance Quality", 0, 100, 70)
+    with col_b:
+        eco_mobility = st.slider("Public/Eco Mobility", 0, 100, 45)
+        roadwork_yes = st.toggle("Roadwork Ongoing", value=False)
+        weather_choice = st.selectbox("Weather Conditions", options=list(le.classes_))
+
+    if st.button("Run Prediction", type="primary"):
+        # Generate full feature row from high-level controls.
+        tv_low, tv_high = df["Traffic Volume"].quantile(0.1), df["Traffic Volume"].quantile(0.9)
+        sp_low, sp_high = df["Average Speed"].quantile(0.1), df["Average Speed"].quantile(0.9)
+        cong_low, cong_high = df["Congestion Level"].quantile(0.1), df["Congestion Level"].quantile(0.9)
+        rcu_low, rcu_high = df["Road Capacity Utilization"].quantile(0.1), df["Road Capacity Utilization"].quantile(0.9)
+        tti_low, tti_high = df["Travel Time Index"].quantile(0.1), df["Travel Time Index"].quantile(0.9)
+        inc_low, inc_high = df["Incident Reports"].quantile(0.1), df["Incident Reports"].quantile(0.9)
+        env_low, env_high = df["Environmental Impact"].quantile(0.1), df["Environmental Impact"].quantile(0.9)
+        pt_low, pt_high = df["Public Transport Usage"].quantile(0.1), df["Public Transport Usage"].quantile(0.9)
+        sig_low, sig_high = df["Traffic Signal Compliance"].quantile(0.1), df["Traffic Signal Compliance"].quantile(0.9)
+        park_low, park_high = df["Parking Usage"].quantile(0.1), df["Parking Usage"].quantile(0.9)
+        ped_low, ped_high = df["Pedestrian and Cyclist Count"].quantile(0.1), df["Pedestrian and Cyclist Count"].quantile(0.9)
+
+        pressure_mix = 0.7 * traffic_intensity + 0.3 * network_stress
+
+        feature_row = {
+            "Traffic Volume": float(np.interp(pressure_mix, [0, 100], [tv_low, tv_high])),
+            "Average Speed": float(np.interp(pressure_mix, [0, 100], [sp_high, sp_low])),
+            "Congestion Level": float(np.interp(pressure_mix, [0, 100], [cong_low, cong_high])),
+            "Road Capacity Utilization": float(np.interp(pressure_mix, [0, 100], [rcu_low, rcu_high])),
+            "Travel Time Index": float(np.interp(pressure_mix, [0, 100], [tti_low, tti_high])),
+            "Incident Reports": float(np.interp(network_stress, [0, 100], [inc_low, inc_high])),
+            "Environmental Impact": float(np.interp(pressure_mix, [0, 100], [env_low, env_high])),
+            "Public Transport Usage": float(np.interp(eco_mobility, [0, 100], [pt_low, pt_high])),
+            "Traffic Signal Compliance": float(np.interp(compliance_level, [0, 100], [sig_low, sig_high])),
+            "Parking Usage": float(np.interp(pressure_mix, [0, 100], [park_low, park_high])),
+            "Pedestrian and Cyclist Count": float(np.interp(eco_mobility, [0, 100], [ped_low, ped_high])),
+            "Roadwork_enc": int(roadwork_yes),
+            "Weather_enc": int(le.transform([weather_choice])[0]),
+        }
+
+        X_new = pd.DataFrame([feature_row])[FEATURES]
+        X_new_scaled = predict_scaler.transform(X_new)
+        pred_cluster = int(predict_kmeans.predict(X_new_scaled)[0])
+        pred_zone = label_zone(feature_row["Congestion Level"])
+
+        try:
+            min_dist = float(np.min(predict_kmeans.transform(X_new_scaled)))
+        except Exception:
+            min_dist = np.nan
+
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("Predicted Cluster", pred_cluster)
+        rc2.metric("Predicted Zone", pred_zone)
+        rc3.metric("Distance to Centroid", f"{min_dist:.3f}" if not np.isnan(min_dist) else "N/A")
+
+        with st.expander("Generated Feature Vector"):
+            st.dataframe(pd.DataFrame([feature_row]).round(3), use_container_width=True)
+
 elif page == "📊 EDA":
     st.markdown("## 📊 Exploratory Data Analysis")
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
